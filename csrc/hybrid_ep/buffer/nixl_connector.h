@@ -32,10 +32,13 @@ struct NixlPeerInfo {
     char ip[MAX_IP_LENGTH];
     char boot_id[MAX_BOOT_ID_LENGTH];
     ino_t ipc_namespace_inode;
-    // Dispatch receive buffers
-    void *rdma_buffer_ptr;
-    void *rdma_prob_buffer_ptr;
-    void *rdma_scaling_factor_buffer_ptr;
+    // Dispatch receive buffers. `rdma_packed_buffer_ptr` points at the
+    // packed staging that consolidates the previous token/prob/SF slots
+    // into one per-token-strided buffer so the sender can issue a single
+    // nixlPut per run. Per-peer stride within the packed buffer is
+    // max_tokens * packed_per_token_stride.
+    void *rdma_packed_buffer_ptr;
+    size_t rdma_packed_per_token_stride;
     uint64_t *dispatch_flags_ptr;
     // Combine receive buffers
     void *combine_rdma_buffer_ptr;

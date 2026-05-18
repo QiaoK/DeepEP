@@ -201,30 +201,49 @@ void Executor::dispatch_preprocess(HybridEpConfigInstance config, DispatchArgs& 
     if(config.num_of_nodes > 1) {
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
         auto sizeof_token_data_type = get_token_data_type_size(config.token_data_type);
+#ifdef USE_NIXL
+        // Pack token + prob (+ optional FP8 SF) into the dest-major,
+        // per-token-strided NIXL send-staging buffer. Per-token entry:
+        //   [token_bytes | prob_bytes | sf_bytes_if_FP8]
+        // Replaces the legacy 3 separate cudaMemcpy + prob restripe; lets
+        // the dispatch N2N warp issue a single packed nixlPut per run.
+        // packed_per_token_stride was set by allocate_dispatch_buffers and
+        // always includes prob bytes (and FP8 SF bytes if applicable);
+        // stride is fixed at allocation time regardless of whether each
+        // dispatch invocation is forward or backward. For backward
+        // dispatch we pass src_prob=nullptr so the pack kernel leaves the
+        // prob region untouched (the receiver does not consume it).
+        const size_t token_bytes = static_cast<size_t>(config.hidden_dim) * sizeof_token_data_type;
+        const size_t prob_bytes  = static_cast<size_t>(config.num_of_experts_per_rank)
+                                   * config.num_of_ranks_per_node * sizeof(float);
+        const bool use_fp8 = (config.token_data_type == APP_TOKEN_DATA_TYPE::UINT8);
+        const size_t sf_bytes = use_fp8
+                                  ? static_cast<size_t>(config.hidden_dim / 128) * sizeof(float)
+                                  : 0;
+        const size_t packed_stride = inter_node_dispatch_buffers->packed_per_token_stride;
+        assert(packed_stride == token_bytes + prob_bytes + sf_bytes);
+        pack_dispatch_for_nixl(
+            args.hidden.data_ptr(),
+            config.forward_dispatch_api ? static_cast<const float*>(args.probs.data_ptr()) : nullptr,
+            use_fp8 ? static_cast<const float*>(args.scaling_factor.data_ptr()) : nullptr,
+            inter_node_dispatch_buffers->attn_input_packed,
+            static_cast<int>(args.num_of_tokens_per_rank),
+            static_cast<int>(config.max_num_of_tokens_per_rank),
+            static_cast<int>(config.num_of_nodes),
+            token_bytes,
+            prob_bytes,
+            sf_bytes,
+            packed_stride,
+            args.stream);
+#else
         CUDA_CHECK(cudaMemcpyAsync(inter_node_dispatch_buffers->attn_input_token, args.hidden.data_ptr(), args.hidden.numel() * sizeof_token_data_type, cudaMemcpyDeviceToDevice, args.stream));
         if(config.forward_dispatch_api) {
-#ifdef USE_NIXL
-            // Stage prob into the dest-major NIXL send layout
-            // `[num_of_nodes][max_tokens][prob_per_token]` so the dispatch
-            // N2N warp coalesces prob puts per chunk (or per run in the
-            // sparse path) instead of one put per token. Same total bytes
-            // as the `cudaMemcpyAsync` it replaces.
-            const int prob_per_token = config.num_of_experts_per_rank * config.num_of_ranks_per_node;
-            restripe_prob_for_nixl_dispatch(
-                static_cast<const float*>(args.probs.data_ptr()),
-                static_cast<float*>(inter_node_dispatch_buffers->attn_input_prob),
-                static_cast<int>(args.num_of_tokens_per_rank),
-                static_cast<int>(config.max_num_of_tokens_per_rank),
-                static_cast<int>(config.num_of_nodes),
-                prob_per_token,
-                args.stream);
-#else
             CUDA_CHECK(cudaMemcpyAsync(inter_node_dispatch_buffers->attn_input_prob, args.probs.data_ptr(), args.probs.numel() * sizeof(float), cudaMemcpyDeviceToDevice, args.stream));
-#endif
         }
         if(config.token_data_type == APP_TOKEN_DATA_TYPE::UINT8) {
             CUDA_CHECK(cudaMemcpyAsync(inter_node_dispatch_buffers->attn_input_scaling_factor, args.scaling_factor.data_ptr(), args.scaling_factor.numel() * sizeof(float), cudaMemcpyDeviceToDevice, args.stream));
         }
+#endif  // USE_NIXL
 #else
         throw std::runtime_error("Multi-node support is not enabled in this build.");
 #endif
@@ -276,6 +295,12 @@ void Executor::dispatch_core(HybridEpConfigInstance config, DispatchArgs& args) 
     param.rdma_inter_node_group_scaling_factor = 
         inter_node_dispatch_buffers->rdma_inter_node_group_scaling_factor;
     param.rdma_inter_node_group_flags = inter_node_dispatch_buffers->rdma_inter_node_group_flags;
+#ifdef USE_NIXL
+    // Packed staging replaces the 3 separate dispatch buffers above for
+    // both the sender-side N2N puts and the receiver-side G2S reads.
+    param.attn_input_packed = reinterpret_cast<const uint8_t*>(inter_node_dispatch_buffers->attn_input_packed);
+    param.rdma_inter_node_group_packed = reinterpret_cast<const uint8_t*>(inter_node_dispatch_buffers->rdma_inter_node_group_packed);
+#endif
 #endif
     param.intra_node_write_completion_flags = 
         intra_node_dispatch_buffers->intra_node_write_completion_flags;

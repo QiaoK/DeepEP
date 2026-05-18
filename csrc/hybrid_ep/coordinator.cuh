@@ -44,6 +44,26 @@ struct InterNodeDispatchBuffers {
     uint64_t *    rdma_inter_node_group_flags = nullptr;
     size_t       rdma_inter_node_group_flags_sz = 0;
     uint64_t *    expected_rdma_flag_value = nullptr;
+#ifdef USE_NIXL
+    // Packed dispatch staging (NIXL only). Replaces the 3 separate
+    // attn_input_{token,prob,scaling_factor} and
+    // rdma_inter_node_group_{token,prob,scaling_factor} buffers with one
+    // per-token-strided packed buffer per side. Per-token layout:
+    //     [token_bytes | prob_bytes | sf_bytes_if_FP8]
+    // packed_per_token_stride = HIDDEN*sizeof(TOKEN) + prob_per_token*4
+    //                         + (FP8 ? HIDDEN/128*4 : 0).
+    // attn_input_packed shape:           [NUM_OF_NODES][max_tokens][stride]
+    // rdma_inter_node_group_packed shape:[NUM_OF_NODES-1][max_tokens][stride]
+    // Collapses 2-3 nixlPuts per dispatch run down to 1 packed put.
+    void *        attn_input_packed = nullptr;
+    size_t       attn_input_packed_sz = 0;
+    void *        rdma_inter_node_group_packed = nullptr;
+    size_t       rdma_inter_node_group_packed_sz = 0;
+    size_t       packed_per_token_stride = 0;
+    size_t       packed_token_offset = 0;
+    size_t       packed_prob_offset = 0;
+    size_t       packed_sf_offset = 0;
+#endif
     // Backend-specific
 #ifndef USE_NIXL
     struct doca_gpu_dev_verbs_qp ** d_qps_gpu = nullptr;
