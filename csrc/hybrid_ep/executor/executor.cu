@@ -506,6 +506,14 @@ void Executor::combine_core(HybridEpConfigInstance config, CombineArgs& args) {
         inter_node_combine_buffers->rdma_inter_node_group_prob;
     param.rdma_inter_node_group_flags =
         inter_node_combine_buffers->rdma_inter_node_group_flags;
+#ifdef USE_NIXL
+    // Packed staging replaces the 4 separate combine buffers above for
+    // both the sender-side N2N puts and the receiver-side G2S reads.
+    param.rdma_intra_node_red_packed =
+        reinterpret_cast<uint8_t*>(inter_node_combine_buffers->rdma_intra_node_red_packed);
+    param.rdma_inter_node_group_packed =
+        reinterpret_cast<const uint8_t*>(inter_node_combine_buffers->rdma_inter_node_group_packed);
+#endif
 #endif
     param.intra_node_write_completion_flags =
         intra_node_combine_buffers->intra_node_write_completion_flags;

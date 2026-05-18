@@ -199,10 +199,8 @@ void NIXLCoordinator::free_buffers() {
     free_ptr(dispatch_buffers.rdma_inter_node_group_packed);
 
     free_ptr(combine_buffers.attn_output_flags);
-    free_ptr(combine_buffers.rdma_intra_node_red_token);
-    free_ptr(combine_buffers.rdma_intra_node_red_prob);
-    free_ptr(combine_buffers.rdma_inter_node_group_token);
-    free_ptr(combine_buffers.rdma_inter_node_group_prob);
+    free_ptr(combine_buffers.rdma_intra_node_red_packed);
+    free_ptr(combine_buffers.rdma_inter_node_group_packed);
     free_ptr(combine_buffers.rdma_inter_node_group_flags);
     free_ptr(combine_buffers.expected_rdma_flag_value);
 }
@@ -259,27 +257,36 @@ void NIXLCoordinator::allocate_dispatch_buffers() {
 }
 
 void NIXLCoordinator::allocate_combine_buffers() {
-    auto rdma_intra_node_red_token_elts = buffer_config.max_num_of_tokens_per_rank *
-        (buffer_config.num_of_nodes - 1) * buffer_config.hidden_dim;
-    auto rdma_intra_node_red_prob_elts = buffer_config.max_num_of_tokens_per_rank * (buffer_config.num_of_nodes - 1) *
-        (buffer_config.num_of_experts_per_rank * buffer_config.num_of_ranks_per_node);
-    auto rdma_inter_node_group_token_elts = buffer_config.max_num_of_tokens_per_rank *
-        (buffer_config.num_of_nodes - 1) * buffer_config.hidden_dim;
-    auto rdma_inter_node_group_prob_elts = buffer_config.max_num_of_tokens_per_rank * (buffer_config.num_of_nodes - 1) *
-        (buffer_config.num_of_experts_per_rank * buffer_config.num_of_ranks_per_node);
+    // Packed combine per-token layout: [token_bytes | prob_bytes].
+    // Combine token type is always BF16 (uint16_t). We always allocate
+    // for the BACKWARD_COMBINE=true case (which is the only configuration
+    // ever instantiated by get_default_config); FORWARD combine kernels
+    // simply leave the prob region unused (small wire overhead, never
+    // exercised in practice).
+    const size_t combine_token_bytes = static_cast<size_t>(buffer_config.hidden_dim) * sizeof(uint16_t);
+    const size_t combine_prob_bytes  = static_cast<size_t>(buffer_config.num_of_experts_per_rank)
+                                     * buffer_config.num_of_ranks_per_node * sizeof(float);
+    const size_t combine_packed_stride = combine_token_bytes + combine_prob_bytes;
+
+    combine_buffers.packed_per_token_stride = combine_packed_stride;
+    combine_buffers.packed_token_offset = 0;
+    combine_buffers.packed_prob_offset  = combine_token_bytes;
+
+    // Both sides have shape [NUM_OF_NODES-1][max_tokens][stride].
+    combine_buffers.rdma_intra_node_red_packed_sz =
+        static_cast<size_t>(buffer_config.num_of_nodes - 1)
+        * buffer_config.max_num_of_tokens_per_rank * combine_packed_stride;
+    combine_buffers.rdma_inter_node_group_packed_sz =
+        combine_buffers.rdma_intra_node_red_packed_sz;
+
     auto rdma_inter_node_group_flags_elts = ((buffer_config.max_num_of_tokens_per_rank - 1) /
         buffer_config.num_of_tokens_per_chunk_combine_api + 1) * (buffer_config.num_of_nodes - 1);
-
-    combine_buffers.rdma_intra_node_red_token_sz = rdma_intra_node_red_token_elts * sizeof(uint16_t);
-    combine_buffers.rdma_intra_node_red_prob_sz = rdma_intra_node_red_prob_elts * sizeof(float);
-    combine_buffers.rdma_inter_node_group_token_sz = rdma_inter_node_group_token_elts * sizeof(uint16_t);
-    combine_buffers.rdma_inter_node_group_prob_sz = rdma_inter_node_group_prob_elts * sizeof(float);
     combine_buffers.rdma_inter_node_group_flags_sz = rdma_inter_node_group_flags_elts * sizeof(uint64_t);
 
-    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.rdma_intra_node_red_token, combine_buffers.rdma_intra_node_red_token_sz));
-    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.rdma_intra_node_red_prob, combine_buffers.rdma_intra_node_red_prob_sz));
-    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.rdma_inter_node_group_token, combine_buffers.rdma_inter_node_group_token_sz));
-    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.rdma_inter_node_group_prob, combine_buffers.rdma_inter_node_group_prob_sz));
+    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.rdma_intra_node_red_packed,
+                          combine_buffers.rdma_intra_node_red_packed_sz));
+    CUDA_CHECK(cudaMalloc((void**)&combine_buffers.rdma_inter_node_group_packed,
+                          combine_buffers.rdma_inter_node_group_packed_sz));
     CUDA_CHECK(cudaMalloc((void**)&combine_buffers.rdma_inter_node_group_flags, combine_buffers.rdma_inter_node_group_flags_sz));
     CUDA_CHECK(cudaMemset(combine_buffers.rdma_inter_node_group_flags, 0, combine_buffers.rdma_inter_node_group_flags_sz));
     CUDA_CHECK(cudaMalloc((void**)&combine_buffers.attn_output_flags, combine_buffers.rdma_inter_node_group_flags_sz));

@@ -288,8 +288,8 @@ void HybridEP_NIXLConnector::updateMemoryBuffers(
     my_peer_info.rdma_packed_buffer_ptr = dispatch_buffers.rdma_inter_node_group_packed;
     my_peer_info.rdma_packed_per_token_stride = dispatch_buffers.packed_per_token_stride;
     my_peer_info.dispatch_flags_ptr = dispatch_buffers.rdma_inter_node_group_flags;
-    my_peer_info.combine_rdma_buffer_ptr = combine_buffers.rdma_inter_node_group_token;
-    my_peer_info.combine_rdma_prob_buffer_ptr = combine_buffers.rdma_inter_node_group_prob;
+    my_peer_info.combine_rdma_packed_buffer_ptr = combine_buffers.rdma_inter_node_group_packed;
+    my_peer_info.combine_rdma_packed_per_token_stride = combine_buffers.packed_per_token_stride;
     my_peer_info.combine_flags_ptr = combine_buffers.rdma_inter_node_group_flags;
     my_peer_info.device_id = local_device_id;
     my_peer_info.rank = rank_uuid;
@@ -689,14 +689,18 @@ void HybridEP_NIXLConnector::_nixl_create_memory_views(const std::vector<int>& r
     // -- Combine memory views --
     NIXL_LOG("    [Rank %d]   Creating combine memory views...\n", rank_uuid);
 
+    // Packed combine staging: one MVH slot per side covers token + prob in a
+    // per-token-strided layout. The combine N2N warp issues a single packed
+    // put per run via this slot, mirroring the dispatch design.
+    const size_t combine_packed_peer_stride =
+        combine_buf->rdma_intra_node_red_packed_sz / std::max(1, num_nodes - 1);
+    NIXL_LOG("    [Rank %d]   Combine packed per-peer stride=%zu bytes (per-token stride=%zu)\n",
+             rank_uuid, combine_packed_peer_stride, combine_buf->packed_per_token_stride);
+
     nixl_xfer_dlist_t combine_local_descs(VRAM_SEG);
-    if (combine_buf->rdma_intra_node_red_token && combine_buf->rdma_intra_node_red_token_sz > 0) {
-        combine_local_descs.addDesc(nixlBlobDesc((uintptr_t)combine_buf->rdma_intra_node_red_token,
-                                                  combine_buf->rdma_intra_node_red_token_sz, local_device_id, ""));
-    }
-    if (combine_buf->rdma_intra_node_red_prob && backward_combine) {
-        combine_local_descs.addDesc(nixlBlobDesc((uintptr_t)combine_buf->rdma_intra_node_red_prob,
-                                                  combine_buf->rdma_intra_node_red_prob_sz, local_device_id, ""));
+    if (combine_buf->rdma_intra_node_red_packed && combine_buf->rdma_intra_node_red_packed_sz > 0) {
+        combine_local_descs.addDesc(nixlBlobDesc((uintptr_t)combine_buf->rdma_intra_node_red_packed,
+                                                  combine_buf->rdma_intra_node_red_packed_sz, local_device_id, ""));
     }
 
     nixl_remote_dlist_t combine_remote_data_descs(VRAM_SEG);
@@ -708,28 +712,14 @@ void HybridEP_NIXLConnector::_nixl_create_memory_views(const std::vector<int>& r
         int my_node_rank_in_remote = (node_rank < actual_node_rank) ? node_rank : (node_rank - 1);
         const std::string& remote_agent_name = nixl_agent_infos[agent_idx].dst_agent_names[remote_rank];
 
-        size_t combine_token_stride = combine_buf->rdma_intra_node_red_token_sz / (num_nodes - 1);
-
-        void* remote_combine_token_addr = (uint8_t*)nixl_peer_info[remote_rank].combine_rdma_buffer_ptr +
-                                          my_node_rank_in_remote * combine_token_stride;
+        void* remote_combine_packed_addr =
+            (uint8_t*)nixl_peer_info[remote_rank].combine_rdma_packed_buffer_ptr +
+            my_node_rank_in_remote * combine_packed_peer_stride;
         combine_remote_data_descs.addDesc(nixlRemoteDesc(
-            (uintptr_t)remote_combine_token_addr,
-            combine_token_stride,
+            (uintptr_t)remote_combine_packed_addr,
+            combine_packed_peer_stride,
             nixl_peer_info[remote_rank].device_id,
             remote_agent_name));
-
-        if (combine_buf->rdma_inter_node_group_prob && backward_combine) {
-            size_t combine_prob_stride = combine_buf->rdma_inter_node_group_prob_sz/(num_nodes-1);
-
-            void* remote_combine_prob_addr = (uint8_t*)nixl_peer_info[remote_rank].combine_rdma_prob_buffer_ptr +
-                                              my_node_rank_in_remote * combine_prob_stride;
-            combine_remote_data_descs.addDesc(nixlRemoteDesc(
-                (uintptr_t)remote_combine_prob_addr,
-                combine_prob_stride,
-                nixl_peer_info[remote_rank].device_id,
-                remote_agent_name));
-
-        }
 
         uint64_t* remote_combine_flag_addr = nixl_peer_info[remote_rank].combine_flags_ptr;
         combine_remote_signal_descs.addDesc(nixlRemoteDesc(
@@ -738,8 +728,8 @@ void HybridEP_NIXLConnector::_nixl_create_memory_views(const std::vector<int>& r
             nixl_peer_info[remote_rank].device_id,
             remote_agent_name));
 
-        NIXL_LOG("    [Rank %d]     combine[%d] -> remote_rank=%d, data=%p, signal=%p\n",
-               rank_uuid, peer_idx, remote_rank, remote_combine_token_addr, (void*)remote_combine_flag_addr);
+        NIXL_LOG("    [Rank %d]     combine[%d] -> remote_rank=%d, packed=%p, signal=%p\n",
+               rank_uuid, peer_idx, remote_rank, remote_combine_packed_addr, (void*)remote_combine_flag_addr);
     }
 
     status = prep_local_mem_view_retry(
@@ -829,8 +819,9 @@ void HybridEP_NIXLConnector::_nixl_build_gpu_contexts(int num_dispatch_blocks, i
     cudaMalloc(&d_combine_flag_counters, sizeof(uint64_t) * num_remote_nodes);
     cudaMemset(d_combine_flag_counters, 0, sizeof(uint64_t) * num_remote_nodes);
 
-    int combine_local_stride = 1 + (int)backward_combine;
-    int combine_remote_stride = combine_local_stride;
+    // Packed combine staging: single MVH slot on both sides.
+    int combine_local_stride = 1;
+    int combine_remote_stride = 1;
 
     combine_gpu_nixl_ctx h_combine_ctx = {};
     h_combine_ctx.local_mvh = nixl_agent_infos[agent_idx].combine_local_mvh;
@@ -871,11 +862,9 @@ void HybridEP_NIXLConnector::_register_buffers_with_agents() {
     NIXL_REGISTER_BUF(dispatch_buf->attn_input_packed, dispatch_buf->attn_input_packed_sz, "attn_input_packed");
     NIXL_REGISTER_BUF(dispatch_buf->rdma_inter_node_group_packed, dispatch_buf->rdma_inter_node_group_packed_sz, "rdma_inter_node_group_packed");
     NIXL_REGISTER_BUF(dispatch_buf->rdma_inter_node_group_flags, dispatch_buf->rdma_inter_node_group_flags_sz, "rdma_inter_node_group_flags");
-    NIXL_REGISTER_BUF(combine_buf->rdma_intra_node_red_token, combine_buf->rdma_intra_node_red_token_sz, "rdma_intra_node_red_token");
-    NIXL_REGISTER_BUF(combine_buf->rdma_intra_node_red_prob, combine_buf->rdma_intra_node_red_prob_sz, "rdma_intra_node_red_prob");
-    NIXL_REGISTER_BUF(combine_buf->rdma_inter_node_group_token, combine_buf->rdma_inter_node_group_token_sz, "combine_rdma_inter_node_group_token");
+    NIXL_REGISTER_BUF(combine_buf->rdma_intra_node_red_packed, combine_buf->rdma_intra_node_red_packed_sz, "rdma_intra_node_red_packed");
+    NIXL_REGISTER_BUF(combine_buf->rdma_inter_node_group_packed, combine_buf->rdma_inter_node_group_packed_sz, "combine_rdma_inter_node_group_packed");
     NIXL_REGISTER_BUF(combine_buf->rdma_inter_node_group_flags, combine_buf->rdma_inter_node_group_flags_sz, "combine_rdma_inter_node_group_flags");
-    NIXL_REGISTER_BUF(combine_buf->rdma_inter_node_group_prob, combine_buf->rdma_inter_node_group_prob_sz, "combine_rdma_inter_node_group_prob");
 
 #undef NIXL_REGISTER_BUF
 

@@ -40,9 +40,14 @@ struct NixlPeerInfo {
     void *rdma_packed_buffer_ptr;
     size_t rdma_packed_per_token_stride;
     uint64_t *dispatch_flags_ptr;
-    // Combine receive buffers
-    void *combine_rdma_buffer_ptr;
-    void *combine_rdma_prob_buffer_ptr;
+    // Combine receive buffer. `combine_rdma_packed_buffer_ptr` points at
+    // the packed receive staging (`rdma_inter_node_group_packed`) that
+    // consolidates the previous token+prob slots into one per-token-strided
+    // buffer so the sender can issue a single nixlPut per run.
+    // Per-peer stride within the packed buffer is
+    // max_tokens * combine_packed_per_token_stride.
+    void *combine_rdma_packed_buffer_ptr;
+    size_t combine_rdma_packed_per_token_stride;
     uint64_t *combine_flags_ptr;
     // Misc
     int device_id;

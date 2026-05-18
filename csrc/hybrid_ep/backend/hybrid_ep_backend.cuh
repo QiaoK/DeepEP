@@ -648,6 +648,16 @@ struct combine_kernel_param_t{
   const uint16_t* rdma_inter_node_group_token;
   const float* rdma_inter_node_group_prob;
   uint64_t* rdma_inter_node_group_flags;
+#ifdef USE_NIXL
+  // Packed combine staging (NIXL only). Replaces the four
+  // rdma_intra_node_red_{token,prob} / rdma_inter_node_group_{token,prob}
+  // pointers above when running multi-node. Per-token byte layout:
+  //   [token_bytes | prob_bytes]
+  // packed_per_token_stride = HIDDEN*2 + num_experts_per_rank*ranks_per_node*4.
+  // Both buffers shape: [NUM_OF_NODES-1][max_tokens][stride].
+  uint8_t* rdma_intra_node_red_packed;
+  const uint8_t* rdma_inter_node_group_packed;
+#endif
   uint32_t* intra_node_write_completion_flags; // For intra-node src ready notification. Need 2 flags for different parity for combine kernel.
   uint32_t* intra_node_expert_input_chunk_flags[MAX_NUM_OF_RANKS_PER_NODE]; // For unpermute red -> intra_node_G2S and inter_node_G2S chunk write completion notification.
   // Metadata buffers. These buffers are local buffers.
@@ -845,6 +855,19 @@ inline __device__ void N2N_warp_group_device_function(const int node_rank,
 // merged into bulk puts (reduces per-nixlPut overhead: atomic WQE reservation,
 // descriptor lookup, doorbell logic). All data puts use nixl_gpu_flags::defer;
 // the final atomic signal uses NODELAY to flush everything in one doorbell.
+// NIXL inter-node combine warp (1 warp per CUDA block).
+// Transfers token + prob (BACKWARD_COMBINE) data via a single packed
+// send-staging buffer with per-token byte layout
+//     [token_bytes | prob_bytes]
+// and shape [NUM_OF_NODES-1][max_tokens][PACKED_STRIDE] on both sender
+// (rdma_intra_node_red_packed) and receiver
+// (rdma_inter_node_group_packed). Each contiguous token run becomes ONE
+// coalesced nixlPut covering both sub-fields, reducing per-(chunk, peer)
+// data WQEs from 2 (BACKWARD_COMBINE=true) down to 1. For
+// BACKWARD_COMBINE=false the prob region is unused on wire (small
+// overhead) but a single put is still issued. All data puts use
+// nixl_gpu_flags::defer; the final atomic signal uses NODELAY to flush
+// everything in one doorbell.
 template<typename INTER_NODE_RDMA_GROUP,
          typename SMEM_TYPE,
          int NUM_OF_STAGES_S2G,
@@ -866,11 +889,16 @@ inline __device__ void inter_node_N2N_warp_group_device_function(
   static_assert(INTER_NODE_RDMA_GROUP::size() == 32, "INTER_NODE_RDMA_GROUP should be 1 warp.");
   static_assert(NUM_OF_TOKENS_PER_CHUNK % INTER_NODE_RDMA_GROUP::size() == 0, "NUM_OF_TOKENS_PER_CHUNK must be multiple of 32.");
 
-  const size_t remote_stride = nixl_ctx->remote_data_mvh_stride;
-  
+  // Packed per-token byte layout (compile-time constants).
+  constexpr size_t COMBINE_TOKEN_BYTES = (size_t)HIDDEN_DIM * sizeof(uint16_t);
+  constexpr size_t COMBINE_PROB_BYTES  = (size_t)NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE * sizeof(float);
+  // Stride matches the allocator (always sized for prob region; the
+  // BACKWARD_COMBINE=false path simply doesn't use that region).
+  constexpr size_t COMBINE_PACKED_STRIDE = COMBINE_TOKEN_BYTES + COMBINE_PROB_BYTES;
+
   int NUM_OF_CHUNKS_PER_RANK = (num_of_tokens_per_rank - 1) / NUM_OF_TOKENS_PER_CHUNK + 1;
   int TOTAL_NUM_OF_CHUNKS = (NUM_OF_NODES - 1) * NUM_OF_CHUNKS_PER_RANK;
-  
+
   const int rdma_to_attn_map_size_per_node = (((num_of_tokens_per_rank - 1) / 16) + 1) * 16;
 
   uint32_t token_consumer_parity = 0;
@@ -897,41 +925,29 @@ inline __device__ void inter_node_N2N_warp_group_device_function(
     }
 
     if (total_tokens == token_range && token_range > 0) {
-      // All tokens in this chunk need write: single coalesced put per buffer
+      // Dense path: full chunk needs write, single packed put covers
+      // token + prob bytes for all `token_range` tokens.
       if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
         unsigned channel_id = blockIdx.x % nixl_ctx->num_channels;
-        {
-          size_t chunk_local_base = (size_t)(rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK
-                                             + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * HIDDEN_DIM * sizeof(uint16_t);
-          size_t chunk_remote_base = (size_t)(chunk_id * NUM_OF_TOKENS_PER_CHUNK) * HIDDEN_DIM * sizeof(uint16_t);
-          size_t chunk_size = (size_t)token_range * HIDDEN_DIM * sizeof(uint16_t);
+        const size_t chunk_local_base =
+            ((size_t)rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK
+             + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * COMBINE_PACKED_STRIDE;
+        const size_t chunk_remote_base =
+            (size_t)(chunk_id * NUM_OF_TOKENS_PER_CHUNK) * COMBINE_PACKED_STRIDE;
+        const size_t chunk_size = (size_t)token_range * COMBINE_PACKED_STRIDE;
 
-          nixlMemViewElem src_desc{nixl_ctx->local_mvh, 0, chunk_local_base};
-          nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + 0, chunk_remote_base};
+        nixlMemViewElem src_desc{nixl_ctx->local_mvh, 0, chunk_local_base};
+        nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx, chunk_remote_base};
 
-          nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
-            src_desc, dst_desc, chunk_size, channel_id, nixl_gpu_flags::defer);
-          assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
-        }
-        if constexpr(BACKWARD_COMBINE) {
-          constexpr size_t prob_per_token = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
-          size_t chunk_local_base = (size_t)(rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK
-                                             + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * prob_per_token * sizeof(float);
-          size_t chunk_remote_base = (size_t)(chunk_id * NUM_OF_TOKENS_PER_CHUNK) * prob_per_token * sizeof(float);
-          size_t chunk_size = (size_t)token_range * prob_per_token * sizeof(float);
-
-          nixlMemViewElem src_desc{nixl_ctx->local_mvh, 1, chunk_local_base};
-          nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + 1, chunk_remote_base};
-
-          nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
-            src_desc, dst_desc, chunk_size, channel_id, nixl_gpu_flags::defer);
-          assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
-        }
+        nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
+          src_desc, dst_desc, chunk_size, channel_id, nixl_gpu_flags::defer);
+        assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
       }
     } else if (total_tokens > 0) {
-      // Sparse routing: merge contiguous token runs into bulk puts.
-      // Each nixlPut has fixed overhead (atomic WQE reservation + descriptor lookup),
-      // so merging N contiguous tokens into 1 put reduces overhead ~N×.
+      // Sparse path: merge contiguous token runs into single packed puts.
+      // Each nixlPut has fixed overhead (atomic WQE reservation + descriptor
+      // lookup); merging N contiguous tokens into 1 packed put reduces
+      // overhead ~N× AND halves WQE count vs the legacy 2-put-per-run path.
       if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
         unsigned channel_id = blockIdx.x % nixl_ctx->num_channels;
         int t = 0;
@@ -942,31 +958,17 @@ inline __device__ void inter_node_N2N_warp_group_device_function(
           const int run_len = t - run_start;
           const int token_start = run_start + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
           const int local_token_start = rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK + token_start;
-          {
-            size_t local_offset = (size_t)local_token_start * HIDDEN_DIM * sizeof(uint16_t);
-            size_t remote_offset = (size_t)token_start * HIDDEN_DIM * sizeof(uint16_t);
-            size_t put_size = (size_t)run_len * HIDDEN_DIM * sizeof(uint16_t);
 
-            nixlMemViewElem src_desc{nixl_ctx->local_mvh, 0, local_offset};
-            nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + 0, remote_offset};
+          const size_t local_offset  = (size_t)local_token_start * COMBINE_PACKED_STRIDE;
+          const size_t remote_offset = (size_t)token_start * COMBINE_PACKED_STRIDE;
+          const size_t put_size      = (size_t)run_len * COMBINE_PACKED_STRIDE;
 
-            nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
-              src_desc, dst_desc, put_size, channel_id, nixl_gpu_flags::defer);
-            assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
-          }
-          if constexpr(BACKWARD_COMBINE) {
-            constexpr size_t prob_per_token = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
-            size_t local_offset = (size_t)local_token_start * prob_per_token * sizeof(float);
-            size_t remote_offset = (size_t)token_start * prob_per_token * sizeof(float);
-            size_t put_size = (size_t)run_len * prob_per_token * sizeof(float);
+          nixlMemViewElem src_desc{nixl_ctx->local_mvh, 0, local_offset};
+          nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx, remote_offset};
 
-            nixlMemViewElem src_desc{nixl_ctx->local_mvh, 1, local_offset};
-            nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + 1, remote_offset};
-
-            nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
-              src_desc, dst_desc, put_size, channel_id, nixl_gpu_flags::defer);
-            assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
-          }
+          nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
+            src_desc, dst_desc, put_size, channel_id, nixl_gpu_flags::defer);
+          assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
         }
       }
     }
@@ -2500,8 +2502,30 @@ inline __device__ void intra_node_red_warp_group_device_function(const int node_
                                                                  const bool* rdma_to_attn_map,
                                                                  uint16_t* rdma_intra_node_red_token,
                                                                  float* rdma_intra_node_red_prob,
+#ifdef USE_NIXL
+                                                                 uint8_t* rdma_intra_node_red_packed,
+#endif
                                                                  SMEM_TYPE* smem_buffer_ptr)
 {
+#ifdef USE_NIXL
+  // Packed combine staging layout (compile-time constants matching the
+  // allocator and the N2N warp's stride). When USE_NIXL is enabled and
+  // we are multi-node, the intra-node-reduction TMA stores target this
+  // single packed buffer at the per-token byte layout:
+  //     [token_bytes | prob_bytes]
+  // instead of writing the two separate rdma_intra_node_red_{token,prob}
+  // buffers. Single-node USE_NIXL builds still take the legacy pointers
+  // (the packed buffer is only allocated for multi-node) — but this
+  // warp is itself guarded by NUM_OF_NODES != 1 at the call site, so
+  // the packed path is always taken under USE_NIXL multi-node.
+  constexpr size_t COMBINE_PACKED_TOKEN_BYTES = (size_t)HIDDEN_DIM * sizeof(uint16_t);
+  constexpr size_t COMBINE_PACKED_PROB_BYTES  = (size_t)NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE * sizeof(float);
+  constexpr size_t COMBINE_PACKED_STRIDE      = COMBINE_PACKED_TOKEN_BYTES + COMBINE_PACKED_PROB_BYTES;
+  constexpr size_t COMBINE_PACKED_TOKEN_OFF   = 0;
+  constexpr size_t COMBINE_PACKED_PROB_OFF    = COMBINE_PACKED_TOKEN_BYTES;
+  (void)rdma_intra_node_red_token;
+  (void)rdma_intra_node_red_prob;
+#endif
   // Load rdma_to_attn_map using LDG.128. Each dst token will need 1 bool from this map.
   using rdma_to_attn_map_load_t = uint4;
   static_assert(sizeof(bool) == 1, "Bool is not 1 byte???");
@@ -2576,11 +2600,20 @@ inline __device__ void intra_node_red_warp_group_device_function(const int node_
     const rdma_to_attn_map_load_t* rdma_to_attn_map_load_base_addr = reinterpret_cast<const rdma_to_attn_map_load_t*>(rdma_to_attn_map + 
                                                                       (node_id * rdma_to_attn_map_size_per_node + chunk_id * NUM_OF_TOKENS_PER_CHUNK));
 
+#ifdef USE_NIXL
+    // Packed receive entries: base = rdma_intra_node_red_packed +
+    //     (rdma_remote_node_id * MAX_NUM_OF_TOKENS_PER_RANK
+    //      + chunk_id * NUM_OF_TOKENS_PER_CHUNK) * COMBINE_PACKED_STRIDE.
+    // (rdma_intra_node_red_id already encodes the first two summands.)
+    uint8_t* rdma_intra_node_red_packed_base_ptr =
+        rdma_intra_node_red_packed + (size_t)rdma_intra_node_red_id * COMBINE_PACKED_STRIDE;
+#else
     uint16_t* rdma_intra_node_red_token_base_ptr = rdma_intra_node_red_token + rdma_intra_node_red_id * static_cast<int64_t>(HIDDEN_DIM);
     float* rdma_intra_node_red_prob_base_ptr;
     if constexpr(BACKWARD_COMBINE){
       rdma_intra_node_red_prob_base_ptr = rdma_intra_node_red_prob + rdma_intra_node_red_id * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
     }
+#endif
 
     // How many dst token entry of current chunk have been in-flight.
     int additional_in_flight_s2g = 0;
@@ -2738,7 +2771,14 @@ inline __device__ void intra_node_red_warp_group_device_function(const int node_
           // Let the TMA thread to issue S2G TMA operations for current token entry.
           if(INTRA_NODE_RED_GROUP::warp_rank() == 0){
             if(elect_sync(~0)){
-              uint16_t* current_token_addr = rdma_intra_node_red_token_base_ptr + (j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k) * static_cast<int64_t>(HIDDEN_DIM);
+              const int token_in_chunk = j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k;
+#ifdef USE_NIXL
+              uint8_t* packed_entry_base = rdma_intra_node_red_packed_base_ptr
+                  + (size_t)token_in_chunk * COMBINE_PACKED_STRIDE;
+              uint8_t* current_token_addr = packed_entry_base + COMBINE_PACKED_TOKEN_OFF;
+#else
+              uint16_t* current_token_addr = rdma_intra_node_red_token_base_ptr + token_in_chunk * static_cast<int64_t>(HIDDEN_DIM);
+#endif
               // Store the token from shared to global.
               cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
                                        cuda::ptx::space_shared,
@@ -2748,7 +2788,11 @@ inline __device__ void intra_node_red_warp_group_device_function(const int node_
 
               // Store the prob from shared to global(Optional).
               if constexpr(BACKWARD_COMBINE){
-                float* current_prob_addr = rdma_intra_node_red_prob_base_ptr + (j * NUM_OF_TOKENS_PER_RDMA_TO_ATTN_LOAD_ITER + k) * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
+#ifdef USE_NIXL
+                uint8_t* current_prob_addr = packed_entry_base + COMBINE_PACKED_PROB_OFF;
+#else
+                float* current_prob_addr = rdma_intra_node_red_prob_base_ptr + token_in_chunk * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
+#endif
                 cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
                                          cuda::ptx::space_shared,
                                          reinterpret_cast<void*>(current_prob_addr),
@@ -3006,10 +3050,27 @@ inline __device__ void inter_node_G2S_warp_group_device_function(const int node_
                                                                  float* const* remote_expert_input_prob,
                                                                  const uint16_t* rdma_inter_node_group_token,
                                                                  const float* rdma_inter_node_group_prob,
+#ifdef USE_NIXL
+                                                                 const uint8_t* rdma_inter_node_group_packed,
+#endif
                                                                  uint32_t* intra_node_expert_input_chunk_flags,
                                                                  uint64_t* rdma_inter_node_group_flags,
                                                                  SMEM_TYPE* smem_buffer_ptr)
 {
+#ifdef USE_NIXL
+  // Packed combine staging layout (compile-time constants matching the
+  // allocator, N2N warp, and intra-node-reduction warp). When multi-node
+  // under USE_NIXL we read token + prob from the single packed receive
+  // buffer instead of the two rdma_inter_node_group_{token,prob}
+  // buffers. Per-token byte layout: [token_bytes | prob_bytes].
+  constexpr size_t COMBINE_G2S_PACKED_TOKEN_BYTES = (size_t)HIDDEN_DIM * sizeof(uint16_t);
+  constexpr size_t COMBINE_G2S_PACKED_PROB_BYTES  = (size_t)NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE * sizeof(float);
+  constexpr size_t COMBINE_G2S_PACKED_STRIDE      = COMBINE_G2S_PACKED_TOKEN_BYTES + COMBINE_G2S_PACKED_PROB_BYTES;
+  constexpr size_t COMBINE_G2S_PACKED_TOKEN_OFF   = 0;
+  constexpr size_t COMBINE_G2S_PACKED_PROB_OFF    = COMBINE_G2S_PACKED_TOKEN_BYTES;
+  (void)rdma_inter_node_group_token;
+  (void)rdma_inter_node_group_prob;
+#endif
   // The warps from inter-node G2S warp group will be divided into multiple independent pipeline. 
   // Each pipeline can only have 1 warp, so INTER_NODE_G2S_GROUP::warp_size() == NUM_OF_DATA_PIPELINE_PER_BLOCK and warp has the same meaning as pipeline in inter-node G2S warp group.
   // Number of pipeline should match inter-node red warp group, so they can coupled into multiple independent data pipeline within a CUDA block.
@@ -3228,10 +3289,19 @@ inline __device__ void inter_node_G2S_warp_group_device_function(const int node_
               while(!cuda::ptx::mbarrier_try_wait_parity(&smem_buffer_ptr->inter_node_mbarrier_G2S_buffer[token_stage][1], token_consumer_parity)){}
               // Load the src token from this rdma inter-node group buffer chunk to shared memory entry.
               uint32_t total_tx_size = 0;
-              const uint16_t* rdma_inter_node_group_token_load_addr = rdma_inter_node_group_token + 
-                                                                      (rdma_buffer_tile_id * MAX_NUM_OF_TOKENS_PER_RANK + 
-                                                                      i * NUM_OF_TOKENS_PER_CHUNK + 
-                                                                      j * NUM_OF_TOKENS_PER_GROUP + k) * static_cast<int64_t>(HIDDEN_DIM);
+              const int64_t inter_node_token_idx =
+                  (int64_t)rdma_buffer_tile_id * MAX_NUM_OF_TOKENS_PER_RANK
+                  + i * NUM_OF_TOKENS_PER_CHUNK
+                  + j * NUM_OF_TOKENS_PER_GROUP + k;
+#ifdef USE_NIXL
+              const uint8_t* packed_entry_base =
+                  rdma_inter_node_group_packed + (size_t)inter_node_token_idx * COMBINE_G2S_PACKED_STRIDE;
+              const uint8_t* rdma_inter_node_group_token_load_addr =
+                  packed_entry_base + COMBINE_G2S_PACKED_TOKEN_OFF;
+#else
+              const uint16_t* rdma_inter_node_group_token_load_addr =
+                  rdma_inter_node_group_token + inter_node_token_idx * static_cast<int64_t>(HIDDEN_DIM);
+#endif
               cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
                                        cuda::ptx::space_global,
                                        reinterpret_cast<void*>(&smem_buffer_ptr->inter_node_token_G2S_buffer[token_stage][0]),
@@ -3242,10 +3312,13 @@ inline __device__ void inter_node_G2S_warp_group_device_function(const int node_
               total_tx_size += (uint32_t)(HIDDEN_DIM * sizeof(uint16_t));
 
               if constexpr(BACKWARD_COMBINE){
-                const float* rdma_inter_node_group_prob_load_addr = rdma_inter_node_group_prob + 
-                                                                    (rdma_buffer_tile_id * MAX_NUM_OF_TOKENS_PER_RANK + 
-                                                                    i * NUM_OF_TOKENS_PER_CHUNK + 
-                                                                    j * NUM_OF_TOKENS_PER_GROUP + k) * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
+#ifdef USE_NIXL
+                const uint8_t* rdma_inter_node_group_prob_load_addr =
+                    packed_entry_base + COMBINE_G2S_PACKED_PROB_OFF;
+#else
+                const float* rdma_inter_node_group_prob_load_addr =
+                    rdma_inter_node_group_prob + inter_node_token_idx * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE);
+#endif
 
                 cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
                                          cuda::ptx::space_global,
@@ -4767,7 +4840,11 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
         intra_node_red_warp_group_device_function
         <INTRA_NODE_RED_GROUP, cur_smem_t, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK,
         NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE>
-        (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.rdma_intra_node_red_token, param.rdma_intra_node_red_prob, smem_buffer_ptr);
+        (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.rdma_intra_node_red_token, param.rdma_intra_node_red_prob,
+#ifdef USE_NIXL
+        param.rdma_intra_node_red_packed,
+#endif
+        smem_buffer_ptr);
       }
     }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size()){
       // Inter-node reduction warp group.
@@ -4789,7 +4866,10 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
       <cur_smem_t, INTER_NODE_G2S_GROUP, NUM_OF_STAGES_G2S, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS,
       NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE>
       (param.node_rank, param.local_rank, param.num_of_tokens_per_rank, param.expected_unpermute_flag_value, param.expected_rdma_flag_value, param.rdma_to_attn_map, param.attn_to_rdma_map, 
-      param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob, param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob, 
+      param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob, param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob,
+#ifdef USE_NIXL
+      param.rdma_inter_node_group_packed,
+#endif
       param.intra_node_expert_input_chunk_flags[param.local_rank], param.rdma_inter_node_group_flags, smem_buffer_ptr);
     }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size()){
       // Inter-node rdma warp group.
@@ -4838,7 +4918,11 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
       intra_node_red_warp_group_device_function
       <INTRA_NODE_RED_GROUP, cur_smem_t, NUM_OF_STAGES_G2S, NUM_OF_STAGES_S2G, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK,
       NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE>
-      (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.rdma_intra_node_red_token, param.rdma_intra_node_red_prob, smem_buffer_ptr);
+      (param.node_rank, param.num_of_tokens_per_rank, param.rdma_to_attn_map, param.rdma_intra_node_red_token, param.rdma_intra_node_red_prob,
+#ifdef USE_NIXL
+      param.rdma_intra_node_red_packed,
+#endif
+      smem_buffer_ptr);
     }
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size()){
     // Inter-node reduction warp group.
@@ -4860,7 +4944,10 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t pa
     <cur_smem_t, INTER_NODE_G2S_GROUP, NUM_OF_STAGES_G2S, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_OF_EXPERTS_PER_RANK, NUM_OF_RANKS_PER_NODE, NUM_OF_NODES, NUM_OF_BLOCKS,
     NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE>
     (param.node_rank, param.local_rank, param.num_of_tokens_per_rank, param.expected_unpermute_flag_value, param.expected_rdma_flag_value, param.rdma_to_attn_map, param.attn_to_rdma_map, 
-    param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob, param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob, 
+    param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob, param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob,
+#ifdef USE_NIXL
+    param.rdma_inter_node_group_packed,
+#endif
     param.intra_node_expert_input_chunk_flags[param.local_rank], param.rdma_inter_node_group_flags, smem_buffer_ptr);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size()){
     // Inter-node rdma warp group.

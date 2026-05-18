@@ -88,6 +88,25 @@ struct InterNodeCombineBuffers {
     uint64_t *    rdma_inter_node_group_flags = nullptr;
     size_t       rdma_inter_node_group_flags_sz = 0;
     uint64_t *    expected_rdma_flag_value = nullptr;
+#ifdef USE_NIXL
+    // Packed combine staging (NIXL only). Replaces the separate
+    // rdma_intra_node_red_{token,prob} (send-side) and
+    // rdma_inter_node_group_{token,prob} (recv-side) buffers with one
+    // per-token-strided packed buffer per side. Per-token layout:
+    //     [token_bytes | prob_bytes]
+    // packed_per_token_stride = HIDDEN*sizeof(uint16_t)
+    //                         + num_experts_per_rank * ranks_per_node * 4.
+    // Both buffers shape: [NUM_OF_NODES-1][max_tokens][stride].
+    // Combine token type is always BF16 so no FP8 SF region; for
+    // BACKWARD_COMBINE=true this collapses 2 nixlPuts per run down to 1.
+    void *        rdma_intra_node_red_packed = nullptr;
+    size_t       rdma_intra_node_red_packed_sz = 0;
+    void *        rdma_inter_node_group_packed = nullptr;
+    size_t       rdma_inter_node_group_packed_sz = 0;
+    size_t       packed_per_token_stride = 0;
+    size_t       packed_token_offset = 0;
+    size_t       packed_prob_offset = 0;
+#endif
     // Backend-specific
 #ifndef USE_NIXL
     struct doca_gpu_dev_verbs_qp ** d_qps_gpu = nullptr;
