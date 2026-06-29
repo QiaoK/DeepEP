@@ -232,7 +232,10 @@ class HybridEPBuffer:
 
         if num_dispatched_tokens is None:
             # Synchronize the stream to make sure the data in the pinned_memory_buffer: num_dispatched_tokens_tensor is ready.
-            torch.cuda.current_stream().synchronize()
+            # Skipping the sync during CUDA graph capture; the dispatched count is only read on the host at replay time
+            # (or by the caller after the graph is fully captured), so the capture itself doesn't depend on it.
+            if not torch.cuda.is_current_stream_capturing():
+                torch.cuda.current_stream().synchronize()
 
         dispatched_token, dispatched_probs, dispatched_scaling_factor = (
             self.runtime.dispatch(
