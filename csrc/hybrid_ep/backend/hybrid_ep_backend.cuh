@@ -745,10 +745,17 @@ inline __device__ void N2N_warp_group_device_function(const int node_rank,
         // and (if FP8) SF into single puts. Prob coalescing relies on the
         // dest-major source layout `[NUM_OF_NODES][max_tokens][prob_per_token]`
         // set up by `restripe_prob_for_nixl_dispatch`.
+        //
+        // PERF EXPERIMENT (qkang/hybrid-ep-perf-tuning): swap THREAD-level
+        // puts for WARP-level. All 32 lanes of INTER_NODE_GROUP compute the
+        // same descriptors (outer-loop uniforms + template constants), so
+        // we just drop the `if (thread_rank==0)` guard and let the warp
+        // cooperate on the doorbell. Matches the issue strategy that
+        // NIXL_EP_LOW_LATENCY uses at csrc/kernels/nixl_ep_ll.cu:193.
         constexpr uint64_t DEFER = nixl_gpu_flags::defer;
         const unsigned channel_id = blockIdx.x % nixl_ctx->num_channels;
 
-        if (INTER_NODE_GROUP::thread_rank() == 0) {
+        {
           size_t chunk_local_base = (size_t)chunk_base_token_idx * HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
           size_t chunk_remote_base = (size_t)chunk_base_token_idx * HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
           size_t chunk_size = (size_t)token_range * HIDDEN_DIM * sizeof(TOKEN_DATA_TYPE);
@@ -756,41 +763,37 @@ inline __device__ void N2N_warp_group_device_function(const int node_rank,
           nixlMemViewElem src_desc{nixl_ctx->local_mvh, 0, chunk_local_base};
           nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + 0, chunk_remote_base};
 
-          nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
+          nixl_status_t status = nixlPut<nixl_gpu_level_t::WARP>(
             src_desc, dst_desc, chunk_size, channel_id, DEFER);
           assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
         }
 
         if constexpr (FORWARD_DISPATCH) {
-          if (INTER_NODE_GROUP::thread_rank() == 0) {
-            constexpr size_t prob_per_token = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
-            // Source slot for the (actual_remote_node_rank, chunk) range under the dest-major layout.
-            size_t local_offset = ((size_t)actual_remote_node_rank * MAX_NUM_OF_TOKENS_PER_RANK + chunk_base_token_idx) * prob_per_token * sizeof(float);
-            size_t remote_offset = (size_t)chunk_base_token_idx * prob_per_token * sizeof(float);
-            size_t put_size = (size_t)token_range * prob_per_token * sizeof(float);
+          constexpr size_t prob_per_token = NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE;
+          // Source slot for the (actual_remote_node_rank, chunk) range under the dest-major layout.
+          size_t local_offset = ((size_t)actual_remote_node_rank * MAX_NUM_OF_TOKENS_PER_RANK + chunk_base_token_idx) * prob_per_token * sizeof(float);
+          size_t remote_offset = (size_t)chunk_base_token_idx * prob_per_token * sizeof(float);
+          size_t put_size = (size_t)token_range * prob_per_token * sizeof(float);
 
-            nixlMemViewElem src_desc{nixl_ctx->local_mvh, 1, local_offset};
-            nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + 1, remote_offset};
+          nixlMemViewElem src_desc{nixl_ctx->local_mvh, 1, local_offset};
+          nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + 1, remote_offset};
 
-            nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
-              src_desc, dst_desc, put_size, channel_id, DEFER);
-            assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
-          }
+          nixl_status_t status = nixlPut<nixl_gpu_level_t::WARP>(
+            src_desc, dst_desc, put_size, channel_id, DEFER);
+          assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
         }
 
         if constexpr (std::is_same<TOKEN_DATA_TYPE, uint8_t>::value) {
-          if (INTER_NODE_GROUP::thread_rank() == 0) {
-            size_t chunk_local_base = (size_t)chunk_base_token_idx * (HIDDEN_DIM / 128) * sizeof(float);
-            size_t chunk_remote_base = (size_t)chunk_base_token_idx * (HIDDEN_DIM / 128) * sizeof(float);
-            size_t chunk_size = (size_t)token_range * (HIDDEN_DIM / 128) * sizeof(float);
+          size_t chunk_local_base = (size_t)chunk_base_token_idx * (HIDDEN_DIM / 128) * sizeof(float);
+          size_t chunk_remote_base = (size_t)chunk_base_token_idx * (HIDDEN_DIM / 128) * sizeof(float);
+          size_t chunk_size = (size_t)token_range * (HIDDEN_DIM / 128) * sizeof(float);
 
-            nixlMemViewElem src_desc{nixl_ctx->local_mvh, (size_t)(local_stride - 1), chunk_local_base};
-            nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + (remote_stride - 1), chunk_remote_base};
+          nixlMemViewElem src_desc{nixl_ctx->local_mvh, (size_t)(local_stride - 1), chunk_local_base};
+          nixlMemViewElem dst_desc{nixl_ctx->remote_data_mvh, (size_t)remote_idx * remote_stride + (remote_stride - 1), chunk_remote_base};
 
-            nixl_status_t status = nixlPut<nixl_gpu_level_t::THREAD>(
-              src_desc, dst_desc, chunk_size, channel_id, DEFER);
-            assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
-          }
+          nixl_status_t status = nixlPut<nixl_gpu_level_t::WARP>(
+            src_desc, dst_desc, chunk_size, channel_id, DEFER);
+          assert(status == NIXL_SUCCESS || status == NIXL_IN_PROG);
         }
       } else {
         // Sparse path: separate count pass then run-merged puts.
