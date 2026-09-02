@@ -186,6 +186,58 @@ def test_hybrid_ep_correctness(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, us
     torch.cuda.profiler.stop()
 
 
+def test_plain_dispatch_capture(buffer: deep_ep.HybridEPBuffer):
+    """Cover capturing dispatch() itself.
+
+    The cases above always hand dispatch_with_permute an explicit
+    num_permuted_tokens, so they never exercise the no-permute path whose
+    output shape has to come from the caller. Without a count that shape is
+    unknowable at capture time, and honouring a supplied count is what keeps
+    the recorded allocation and D2D copies correct.
+    """
+    hidden, probs, scaling_factor, routing_map = init_tensor(
+        hidden_dim=HIDDEN_DIM,
+        seq_len=NUM_TOKENS_PER_RANK,
+        topk=TOPK,
+        num_of_experts=NUM_OF_EXPERTS,
+    )
+
+    # Warm up outside capture. This also leaves the warmup's own count in the
+    # pinned buffer, which is what the explicit count below is checked against.
+    warm_token, _, _, _ = buffer.dispatch(
+        hidden=hidden, scaling_factor=scaling_factor,
+        routing_map=routing_map, probs=probs)
+    warm_count = warm_token.shape[0]
+    torch.cuda.synchronize()
+
+    # Without a count the shape cannot be known, so this has to be refused
+    # rather than capturing whatever the pinned buffer happens to hold.
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            buffer.dispatch(hidden=hidden, scaling_factor=scaling_factor,
+                            routing_map=routing_map, probs=probs)
+        raise AssertionError("capturing dispatch() without a count should be refused")
+    except RuntimeError as exc:
+        assert "num_dispatched_tokens" in str(exc), f"unclear error: {exc}"
+
+    torch.cuda.synchronize()
+
+    # Stay below the warmup count so the sized copies are in bounds, while
+    # still differing from the value left in the pinned buffer.
+    target = max(1, warm_count - 128)
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        out_token, _, _, _ = buffer.dispatch(
+            hidden=hidden, scaling_factor=scaling_factor,
+            routing_map=routing_map, probs=probs,
+            num_dispatched_tokens=target)
+    assert out_token.shape[0] == target, (
+        f"output has {out_token.shape[0]} rows, expected {target}; the count was "
+        f"read back instead of honoured (warmup count was {warm_count})")
+
+    torch.cuda.synchronize()
+    print_in_order("test_plain_dispatch_capture passed")
+
+
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
@@ -217,6 +269,9 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     num_of_ranks_per_node=NUM_OF_RANKS_PER_NODE,
                 )
                 test_hybrid_ep_correctness(buffer, ref, use_fp8, with_probs, fused_permute_dispatch)
+
+                if not use_fp8 and with_probs and not fused_permute_dispatch:
+                    test_plain_dispatch_capture(buffer)
 
     dist.barrier()
     dist.destroy_process_group()
