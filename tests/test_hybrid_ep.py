@@ -550,6 +550,13 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             NUM_OF_RANKS_PER_NODE = buffer.num_of_hybrid_ep_ranks_per_nvlink_domain
             NUM_OF_NODES = buffer.num_of_nodes
             NUM_OF_EXPERTS = NUM_LOCAL_EXPERTS * NUM_OF_RANKS_PER_NODE * NUM_OF_NODES
+            if group.rank() == 0:
+                # Surface the topology: if it is ever wrong, the symptom is an
+                # expert-slicing mismatch, which is a confusing way to find out.
+                print(f"[topology] ranks_per_nvlink_domain={NUM_OF_RANKS_PER_NODE} "
+                      f"num_of_nodes={NUM_OF_NODES} num_of_experts={NUM_OF_EXPERTS} "
+                      f"(from the buffer; override with "
+                      f"NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN)", flush=True)
 
             ref = TorchRef(
                 ep_group=group,
